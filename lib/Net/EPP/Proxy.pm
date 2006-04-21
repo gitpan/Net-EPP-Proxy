@@ -2,21 +2,105 @@
 # free software; you can redistribute it and/or modify it under the same
 # terms as Perl itself.
 # 
-# $Id: Proxy.pm,v 1.2 2006/02/14 16:47:06 gavin Exp $
+# $Id: Proxy.pm,v 1.5 2006/04/21 12:04:35 gavin Exp $
 package Net::EPP::Proxy;
 use bytes;
 use Carp;
 use Digest::MD5 qw(md5_hex);
 use Net::EPP::Client;
 use Net::EPP::Frame;
-use Net::Server::PreForkSimple;
 use Time::HiRes qw(time);
-use base qw(Net::Server::PreForkSimple);
-use vars qw($VERSION $CLIENT $GREETING $MAXLOAD $TIMEOUT);
+use XML::LibXML;
+use base qw(Net::Server::Multiplex);
+use vars qw($VERSION);
 use strict;
 
-our $VERSION = '0.0.1';
+our $VERSION = '0.02';
 
+sub new { bless({epp => {parser => XML::LibXML->new}}, shift) }
+
+sub init {
+	my ($self, %params) = @_;
+
+	# build our EPP client:
+	$self->{epp}->{client} = Net::EPP::Client->new(
+		host	=> $params{remote_host},
+		port	=> $params{remote_port},
+		ssl	=> $params{ssl},
+	);
+
+	# connect to the remote server and cache the greeting:
+	$self->{epp}->{greeting} = $self->{epp}->{client}->connect;
+
+	# build the login frame:
+	my $login = Net::EPP::Frame::Command::Login->new;
+
+	# add credentials:
+	$login->clID->appendText($params{clid});
+	$login->pw->appendText($params{pw});
+
+	# add client transaction ID:
+	$login->clTRID->appendText(md5_hex(ref($self).time().$$));
+
+	# add object URIs:
+	foreach my $uri (@{$params{svcs}}) {
+		my $el = $login->createElement('objURI');
+		$el->appendText($uri);
+		$login->svcs->appendChild($el);
+	}
+
+	# submit the login request:
+	my $answer = $self->{epp}->{parser}->parse_string($self->{epp}->{client}->request($login));
+
+	# check the response:
+	if ($answer->getElementsByTagNameNS('urn:ietf:params:xml:ns:epp-1.0', 'result')->shift->getAttribute('code') != 1000) {
+		my $message = ($answer->getElementsByTagNameNS('urn:ietf:params:xml:ns:epp-1.0', 'msg')->shift->getChildNodes)[0]->data;
+		croak('Unable to log into to server using supplied credentials: '.$message);
+	}
+
+	# set the timeout for subsequent requests:
+	$self->{epp}->{timeout} = (int($params{req_timeout}) > 0 ? int($params{req_timeout}) : 5);
+
+	# run the main server loop:
+	return $self->SUPER::run(%params);
+}
+
+# new connection, send the greeting:
+sub mux_connection {
+	my ($self, $mux, $peer) = @_;
+	print pack('N', length($self->{net_server}->{epp}->{greeting}) + 4).$self->{net_server}->{epp}->{greeting};
+}
+
+# a request frame was received, transmit to remote server and return response to client:
+sub mux_input {
+	my ($self, $mux, $peer, $input) = @_;
+	my $hdr		= substr(${$input}, 0, 4);
+	my $length	= unpack('N', $hdr) - 4;
+	my $question	= substr(${$input}, 4, $length);
+
+	my $answer;
+	eval {
+		local $SIG{ALRM} = sub { die };
+		alarm($self->{net_server}->{epp}->{timeout});
+		$answer = $self->{net_server}->{epp}->{client}->request($question);
+		alarm(0);
+	};
+	if ($@ ne '') {
+		croak("error getting answer from remote server: $@ (timeout $self->{net_server}->{epp}->{timeout} secs)");
+
+	} elsif (length($answer) < 1) {
+		croak(sprintf('error getting answer from remote server: answer was %d bytes long', length($answer)));
+
+	} else {
+		print pack('N', length($answer) + 4).$answer;
+
+	}
+
+}
+
+1;
+
+__END__
 =pod
 
 =head1 NAME
@@ -25,17 +109,27 @@ Net::EPP::Proxy - a proxy server for the EPP protocol.
 
 =head1 SYNOPSIS
 
+Construct your server process like so:
+
 	#!/usr/bin/perl
 	use Net::EPP::Proxy;
+	use Net::EPP::Frame::ObjectSpec;
 	use strict;
 
-	Net::EPP::Proxy->init(
+	my $proxy = Net::EPP::Proxy->new;
+
+	$proxy->init(
 		# EPP-specific params:
 		remote_host	=> 'epp.nic.tld',
 		remote_port	=> 700,
 		ssl		=> 1,
 		clid		=> $CLID,
 		pw		=> $PW,
+		svcs		=> [
+			(Net::EPP::Frame::ObjectSpec->spec('domain'))[1],
+			(Net::EPP::Frame::ObjectSpec->spec('host'))[1],
+			(Net::EPP::Frame::ObjectSpec->spec('contact'))[1],
+		],
 
 		# Net::Server params:
 		host		=> 'localhost',
@@ -45,7 +139,7 @@ Net::EPP::Proxy - a proxy server for the EPP protocol.
 		min_servers	=> 5,
 	);
 
-	### then in the client processes:
+Then, in your client processes:
 
 	my $client = Net::EPP::Client->new(
 		host	=> 'localhost',
@@ -78,8 +172,6 @@ remote EPP server using the supplied credentials. Each proxy can connect to a
 single remote server - if you want to proxy for multiple servers you should
 create a proxy server for each, perhaps listening on a different TCP port.
 
-	Figure 1.0 - multiple clients connecting to a remote server
-
 	+---+				+---+
 	| C |<-----------//------------>|   |	In this model, each client must
 	+---+				|   |   establish a session with the
@@ -92,7 +184,8 @@ create a proxy server for each, perhaps listening on a different TCP port.
 	| C |<-----------//------------>|   |	connection each time.
 	+---+				+---+
 
-	Figure 1.1 - multiple clients connecting to a proxy
+	Figure 1 - multiple clients connecting to a remote server
+
 
 	+---+		+---+		+---+
 	| C |<--------->|   |		|   |	In this model, the proxy server
@@ -105,6 +198,8 @@ create a proxy server for each, perhaps listening on a different TCP port.
 	+---+		|   |		| R |
 	| C |<--------->|   |		|   |
 	+---+		+---+		+---+
+
+	Figure 2 - multiple clients connecting to a proxy
 
 When a local client connects to the proxy, it is immediately sent the EPP
 C<E<lt>greetingE<gt>> frame the proxy server received from the remote server.
@@ -123,7 +218,9 @@ L<Net::EPP::Client> module, the Net_EPP_Client PHP class, etc)>.
 
 To start an EPP proxy server instance, use the following syntax:
 
-	Net::EPP::Proxy->init(%PARAMS);
+	my $proxy = Net::EPP::Proxy->new;
+
+	$proxy->init(%PARAMS);
 
 The C<%PARAMS> hash contain any of the configuration variables allowed by
 L<Net::Server>, plus the following:
@@ -140,7 +237,7 @@ The TCP port number of the remote EPP server to connect to (usually 700).
 
 =item C<ssL>
 
-Whether to use SSL (usually true).
+Whether to use SSL to connect to the remote server (usually true).
 
 =item C<clid>
 
@@ -157,6 +254,13 @@ If there is a network outage or some other undefined error, the server will
 C<croak()>. You should use an C<eval()> or an external "angel" script to catch
 the error and restart the server if this happens.
 
+=item C<svcs>
+
+All clients are required to identify all the objects they intend to manage
+during the session. This parameter should be a reference to an array of
+object namespaces. The L<Net::EPP::Frame::ObjectSpec> module provides easy
+access to the standard EPP object URIs.
+
 =back
 
 If the proxy is unable to authenticate with the remote EPP server it will
@@ -165,10 +269,12 @@ C<croak()>.
 =head1 LOGGING, CONFIGURATION AND PERFORMANCE TUNING
 
 See the documentation for L<Net::Server> for information about configuring the
-server to do logging, and tweaking performance values. Net::EPP::Proxy uses
-the L<Net::Server::PreForkSimple> model to handle connections, so for example
-you can use the C<max_servers> and C<min_servers> to control how many child
-processes the server will spawn.
+server to do logging, and tweaking performance values.
+
+Note that there is a fundamental limitation on performance due to the proxy
+server blocking while waiting for the remote server to respond. If you find
+that this becomes problematic, consider running multiple proxy server instances
+and distributing client connections between them.
 
 =head1 AUTHOR
 
@@ -185,7 +291,11 @@ redistribute it and/or modify it under the same terms as Perl itself.
 
 =item * L<Net::EPP::Client>
 
+=item * L<Net::EPP::Frame>
+
 =item * L<Net::EPP::Proxy>
+
+=item * L<Net::Server>
 
 =item * RFCs 3730 and RFC 3734, available from L<http://www.ietf.org/>.
 
@@ -194,60 +304,3 @@ redistribute it and/or modify it under the same terms as Perl itself.
 =back
 
 =cut
-
-sub init {
-	my ($package, %params) = @_;
-
-	our $CLIENT = Net::EPP::Client->new(
-		host	=> $params{remote_host},
-		port	=> $params{remote_port},
-		ssl	=> $params{ssl},
-	);
-
-	our $GREETING = $CLIENT->connect;
-
-	our $MAXLOAD = $params{max_load} if ($^O eq 'linux');
-
-	our $TIMEOUT = $params{req_timeout};
-
-	my $login = Net::EPP::Frame::Command::Login->new;
-	$login->clID->appendText($params{clid});
-	$login->pw->appendText($params{pw});
-	$login->clTRID->appendText(md5_hex($package.time().$$));
-
-	if ($CLIENT->request($login) =~ /<result code="(\d+)">/) {
-		croak('Unable to log into to server using supplied credentials') if ($1 != 1000);
-	}
-
-	return $package->SUPER::run(%params);
-}
-
-sub process_request {
-	my $self = shift;
-
-	print pack('N', length($GREETING) + 4).$GREETING;
-	while (!eof(select())) {
-		my $hdr;
-		read(select(), $hdr, 4);
-		my $question;
-		read(select(), $question, (unpack('N', $hdr) - 4));
-
-		my $answer;
-		eval {
-			local $SIG{ALRM} = sub { die "timeout\n" };
-			alarm($TIMEOUT);
-			$answer = $CLIENT->request($question);
-			alarm(0);
-		};
-		if ($@ ne '') {
-			croak("error getting answer from remote server: $@ (timeout $TIMEOUT secs)");
-
-		} else {
-			print pack('N', length($answer) + 4).$answer;
-
-		}
-	}
-	return 1;
-}
-
-1;
