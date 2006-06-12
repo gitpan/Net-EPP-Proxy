@@ -2,100 +2,209 @@
 # free software; you can redistribute it and/or modify it under the same
 # terms as Perl itself.
 # 
-# $Id: Proxy.pm,v 1.5 2006/04/21 12:04:35 gavin Exp $
+# $Id: Proxy.pm,v 1.10 2006/06/12 10:05:50 gavin Exp $
 package Net::EPP::Proxy;
 use bytes;
 use Carp;
-use Digest::MD5 qw(md5_hex);
+use Digest::SHA1 qw(sha1_hex);
 use Net::EPP::Client;
 use Net::EPP::Frame;
+use POSIX qw(strftime);
 use Time::HiRes qw(time);
 use XML::LibXML;
 use base qw(Net::Server::Multiplex);
+use constant EPP_XMLNS	=> 'urn:ietf:params:xml:ns:epp-1.0';
 use vars qw($VERSION);
 use strict;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
-sub new { bless({epp => {parser => XML::LibXML->new}}, shift) }
+sub new {
+	my $package = shift;
+	my $self = $package->SUPER::new;
+	$self->{epp} = {parser => XML::LibXML->new};
+	bless($self, $package);
+	return $self;
+}
 
 sub init {
 	my ($self, %params) = @_;
 
+	$self->{epp}->{host}		= $params{remote_host};
+	$self->{epp}->{port}		= $params{remote_port};
+	$self->{epp}->{ssl}		= $params{ssl};
+	$self->{epp}->{timeout}		= (int($params{req_timeout}) > 0 ? int($params{req_timeout}) : 5);
+	$self->{epp}->{clid}		= $params{clid};
+	$self->{epp}->{pw}		= $params{pw};
+	$self->{epp}->{svcs}		= $params{svcs};
+
+	# connect to the server:
+	my ($code, $msg) = $self->epp_connect;
+
+	# check the response:
+	if ($code != 1000) {
+		carp('Unable to log into to server using supplied credentials: '.$msg);
+		return undef;
+	}
+
+	# run the main server loop:
+	return $self->run(%params);
+}
+
+sub epp_connect {
+	my $self = shift;
+
 	# build our EPP client:
 	$self->{epp}->{client} = Net::EPP::Client->new(
-		host	=> $params{remote_host},
-		port	=> $params{remote_port},
-		ssl	=> $params{ssl},
+		host	=> $self->{epp}->{host},
+		port	=> $self->{epp}->{port},
+		ssl	=> $self->{epp}->{ssl},
+		timeout	=> $self->{epp}->{timeout},
+		dom	=> 1,
 	);
 
 	# connect to the remote server and cache the greeting:
-	$self->{epp}->{greeting} = $self->{epp}->{client}->connect;
+	eval { $self->{epp}->{greeting} = $self->{epp}->{client}->connect };
+	if ($@) {
+		carp("Error connecting: $@");
+		return (2500, "Error connecting: $@");
+	}
 
 	# build the login frame:
 	my $login = Net::EPP::Frame::Command::Login->new;
 
 	# add credentials:
-	$login->clID->appendText($params{clid});
-	$login->pw->appendText($params{pw});
+	$login->clID->appendText($self->{epp}->{clid});
+	$login->pw->appendText($self->{epp}->{pw});
 
 	# add client transaction ID:
-	$login->clTRID->appendText(md5_hex(ref($self).time().$$));
+	$login->clTRID->appendText(sha1_hex(ref($self).time().$$));
 
 	# add object URIs:
-	foreach my $uri (@{$params{svcs}}) {
+	my $objects = $self->{epp}->{greeting}->getElementsByTagNameNS(EPP_XMLNS, 'objURI');
+	while (my $object = $objects->shift) {
 		my $el = $login->createElement('objURI');
-		$el->appendText($uri);
+		$el->appendText($object->firstChild->data);
 		$login->svcs->appendChild($el);
 	}
 
 	# submit the login request:
-	my $answer = $self->{epp}->{parser}->parse_string($self->{epp}->{client}->request($login));
+	my $answer = $self->{epp}->{client}->request($login);
 
-	# check the response:
-	if ($answer->getElementsByTagNameNS('urn:ietf:params:xml:ns:epp-1.0', 'result')->shift->getAttribute('code') != 1000) {
-		my $message = ($answer->getElementsByTagNameNS('urn:ietf:params:xml:ns:epp-1.0', 'msg')->shift->getChildNodes)[0]->data;
-		croak('Unable to log into to server using supplied credentials: '.$message);
-	}
-
-	# set the timeout for subsequent requests:
-	$self->{epp}->{timeout} = (int($params{req_timeout}) > 0 ? int($params{req_timeout}) : 5);
-
-	# run the main server loop:
-	return $self->SUPER::run(%params);
+	return ($self->get_result_code($answer), $self->get_result_message($answer));
 }
 
 # new connection, send the greeting:
 sub mux_connection {
 	my ($self, $mux, $peer) = @_;
-	print pack('N', length($self->{net_server}->{epp}->{greeting}) + 4).$self->{net_server}->{epp}->{greeting};
+	print pack('N', length($self->{net_server}->{epp}->{greeting}->toString) + 4).$self->{net_server}->{epp}->{greeting}->toString;
 }
 
 # a request frame was received, transmit to remote server and return response to client:
 sub mux_input {
 	my ($self, $mux, $peer, $input) = @_;
+
 	my $hdr		= substr(${$input}, 0, 4);
 	my $length	= unpack('N', $hdr) - 4;
 	my $question	= substr(${$input}, 4, $length);
 
+	my $oldsig = $SIG{PIPE};
+	$SIG{PIPE} = 'IGNORE';
 	my $answer;
 	eval {
-		local $SIG{ALRM} = sub { die };
+		local $SIG{ALRM} = sub { die("timed out") };
 		alarm($self->{net_server}->{epp}->{timeout});
 		$answer = $self->{net_server}->{epp}->{client}->request($question);
 		alarm(0);
 	};
+	$SIG{PIPE} = $oldsig;
+
+	# initialise some things:
+	my $err = '';
+	my $fatal = 0;
+
 	if ($@ ne '') {
-		croak("error getting answer from remote server: $@ (timeout $self->{net_server}->{epp}->{timeout} secs)");
+		$err = sprintf('error getting answer from remote server: %s timeout %ds)', $@, $self->{net_server}->{epp}->{timeout});
 
-	} elsif (length($answer) < 1) {
-		croak(sprintf('error getting answer from remote server: answer was %d bytes long', length($answer)));
+	} elsif (length($answer->toString) < 1) {
+		$err = sprintf('error getting answer from remote server: answer was %d bytes long', length($answer));
 
-	} else {
-		print pack('N', length($answer) + 4).$answer;
+	} elsif ($self->get_result_code($answer) =~ /^(2500|2501|2502)$/) {
+		$err = sprintf('session error at remote server (code %d)', $self->get_result_code($answer));
 
 	}
 
+	if ($err ne '') {
+		$answer = $self->create_error_frame($question, $err);
+		$fatal = 1;
+	}
+
+	# send answer to client:
+	print pack('N', length($answer->toString) + 4).$answer->toString;
+
+	# clean up:
+	if ($err ne '' && $fatal == 1) {
+		$self->server_close;
+	}
+
+	# clear the buffer:
+	${$input} = '';
+
+	return 1;
+}
+
+sub create_error_frame {
+	my ($self, $question, $err) = @_;
+	my $frame = Net::EPP::Frame::Response->new;
+
+	my $clTRID;
+	eval {
+		my $doc = $self->{epp}->{parser}->parse_string($question);
+		my $nodes = $doc->getElementsByTagNameNS(EPP_XMLNS, 'clTRID');
+		my $node = $nodes->shift;
+		my $text = ($node->getChildNodes)[0];
+		$clTRID = $text->data;
+		print STDERR $question;
+	};
+
+	my $msg = $frame->createElement('msg');
+	$msg->appendText($err);
+
+	$frame->clTRID->appendText($clTRID);
+	$frame->svTRID->appendText(sha1_hex(ref($self).time().$$));
+
+	$frame->result->setAttribute('code', 2500);
+	$frame->result->appendChild($msg);
+
+	return $frame;
+}
+
+sub get_result_code {
+	my ($self, $doc) = @_;
+	my $els = $doc->getElementsByTagNameNS(EPP_XMLNS, 'result');
+	if (defined($els)) {
+		my $el = $els->shift;
+		if (defined($el)) {
+			return $el->getAttribute('code');
+		}
+	}
+	return 2400;
+}
+
+sub get_result_message {
+	my ($self, $doc) = @_;
+	my $els = $doc->getElementsByTagNameNS(EPP_XMLNS, 'msg');
+	if (defined($els)) {
+		my $el = $els->shift;
+		if (defined($el)) {
+			my @children = $el->getChildNodes;
+			if (defined($children[0])) {
+				my $txt = $children[0];
+				return $txt->data if (ref($txt) eq 'XML::LibXML::Text');
+			}
+		}
+	}
+	return 'Unknown message';
 }
 
 1;
@@ -125,11 +234,6 @@ Construct your server process like so:
 		ssl		=> 1,
 		clid		=> $CLID,
 		pw		=> $PW,
-		svcs		=> [
-			(Net::EPP::Frame::ObjectSpec->spec('domain'))[1],
-			(Net::EPP::Frame::ObjectSpec->spec('host'))[1],
-			(Net::EPP::Frame::ObjectSpec->spec('contact'))[1],
-		],
 
 		# Net::Server params:
 		host		=> 'localhost',
@@ -251,20 +355,20 @@ The password to use to authenticate.
 
 The amount of time in seconds to wait for a response from the remote server.
 If there is a network outage or some other undefined error, the server will
-C<croak()>. You should use an C<eval()> or an external "angel" script to catch
-the error and restart the server if this happens.
+send an error frame to the local client and then shut down, so you may
+want to have your invocation script try to re-establish the connection.
 
-=item C<svcs>
+=head2 Object Services
 
-All clients are required to identify all the objects they intend to manage
-during the session. This parameter should be a reference to an array of
-object namespaces. The L<Net::EPP::Frame::ObjectSpec> module provides easy
-access to the standard EPP object URIs.
+Versions of I<Net::EPP::Proxy> prior to 0.03 required that you manually
+specify any service URIs required. As of Version 0.03, the services are
+automatically populated from the C<E<lt>svcMenuE<gt>> element in the
+C<E<lt>greetingE<gt>> received from the remote server.
 
 =back
 
-If the proxy is unable to authenticate with the remote EPP server it will
-C<croak()>.
+If the proxy is unable to authenticate with the remote EPP server then
+the I<init()> method will I<carp()> and then return undef.
 
 =head1 LOGGING, CONFIGURATION AND PERFORMANCE TUNING
 
@@ -296,6 +400,8 @@ redistribute it and/or modify it under the same terms as Perl itself.
 =item * L<Net::EPP::Proxy>
 
 =item * L<Net::Server>
+
+=item * L<IO::Multiplex>
 
 =item * RFCs 3730 and RFC 3734, available from L<http://www.ietf.org/>.
 
